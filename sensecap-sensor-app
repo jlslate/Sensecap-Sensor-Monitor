@@ -34,7 +34,7 @@
  * Smoke sensor:    detected  → RED  |  clear     → fades to YELLOW
  *
  * Author: jlslate (slate)
- * Version: 2.3.0  — fix icon codepoints to confirmed openHASP built-in subset
+ * Version: 3.0.0  — state-driven icons, single grid setting in app, deferred layout push, optimised MQTT batching
  */
 
 definition(
@@ -137,15 +137,6 @@ def mainPage() {
                     defaultValue: "Sensor ${idx}",
                     required: false,
                     width: 3
-
-                input name: "icon${idx}",
-                    type: "enum",
-                    title: "Slot ${idx} — Icon",
-                    options: mdiOptionsFor(type),
-                    defaultValue: "none",
-                    required: false,
-                    submitOnChange: false,
-                    width: 3
             }
         }
 
@@ -212,25 +203,26 @@ def initialize() {
     }
 
     if (settings.syncOnStartup) {
-        runIn(6, syncAllSensors)
+        runIn(8, syncAllSensors)
     }
 
-    // Push labels and slot types to display
+    // Push layout only when grid size changes, then push labels and types
     if (settings.indicatorDevice) {
-        int maxChars = (settings.gridLayout == "4x4") ? 7 : (settings.gridLayout == "3x3") ? 11 : 16
-        def labels    = [:]
-        def slotTypes = [:]
-        (1..maxSlots()).each { idx ->
-            String raw = (settings["label${idx}"] ?: "Sensor ${idx}").toString()
-            labels[idx]    = buildLabel(idx, raw, maxChars)
-            slotTypes[idx] = settings["sensorType${idx}"] ?: "motion"
-        }
-        settings.indicatorDevice.updateLabels(labels)
-        settings.indicatorDevice.updateSlotTypes(slotTypes)
-    }
+        String newGrid = settings.gridLayout ?: "2x2"
+        // Always sync grid to driver so it matches after any reboot
+        settings.indicatorDevice.setGridLayout(newGrid)
 
-    unschedule(updateInfoObjects)
-    unschedule(waitForMqttThenUpdate)
+        if (state.lastPushedGrid != newGrid) {
+            infoLog "[SensorDisplay] Grid changed ${state.lastPushedGrid} → ${newGrid} — pushing new layout"
+            settings.indicatorDevice.pushLayout()
+            state.lastPushedGrid = newGrid
+            // pushLayout takes ~2s — schedule labels/types to arrive after it completes
+            runIn(6, pushLabelsAndTypes)
+        } else {
+            // No layout change — send labels/types shortly
+            runIn(2, pushLabelsAndTypes)
+        }
+    }
 
     // Re-sync all sensor states whenever the SenseCAP display reboots
     if (settings.indicatorDevice) {
@@ -238,6 +230,23 @@ def initialize() {
     }
 
     infoLog "[SensorDisplay] Initialized — ${subscribedCount()} sensor(s) subscribed"
+}
+
+// ── Deferred label/type push ─────────────────────────────────────────────────
+
+def pushLabelsAndTypes() {
+    if (!settings.indicatorDevice) return
+    int maxChars = (settings.gridLayout == "4x4") ? 7 : (settings.gridLayout == "3x3") ? 11 : 16
+    def labels    = [:]
+    def slotTypes = [:]
+    (1..maxSlots()).each { idx ->
+        String raw = (settings["label${idx}"] ?: "Sensor ${idx}").toString()
+        labels[idx]    = wrapLabel(raw, maxChars)
+        slotTypes[idx] = settings["sensorType${idx}"] ?: "motion"
+    }
+    settings.indicatorDevice.updateSlotTypes(slotTypes)
+    pauseExecution(300)
+    settings.indicatorDevice.updateLabels(labels)
 }
 
 // ── Motion Event Handlers ────────────────────────────────────────────────────
@@ -291,7 +300,6 @@ def contactHandler16(evt) { handleContact(evt, 16) }
 private void handleContact(evt, int idx) {
     debugLog "Contact slot ${idx} (${evt.displayName}): ${evt.value}"
     if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
-    // open → red (alert), closed → green (clear)
     if (evt.value == "open") {
         settings.indicatorDevice.setMotionActive(idx)
     } else {
@@ -321,7 +329,6 @@ def waterHandler16(evt) { handleWater(evt, 16) }
 private void handleWater(evt, int idx) {
     debugLog "Water slot ${idx} (${evt.displayName}): ${evt.value}"
     if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
-    // wet → red (alert), dry → green (clear)
     if (evt.value == "wet") {
         settings.indicatorDevice.setMotionActive(idx)
     } else {
@@ -351,7 +358,6 @@ def smokeHandler16(evt) { handleSmoke(evt, 16) }
 private void handleSmoke(evt, int idx) {
     debugLog "Smoke slot ${idx} (${evt.displayName}): ${evt.value}"
     if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
-    // detected → red (alert), clear → yellow (all clear)
     if (evt.value == "detected") {
         settings.indicatorDevice.setMotionActive(idx)
     } else {
@@ -364,7 +370,7 @@ private void handleSmoke(evt, int idx) {
 def syncAllSensors() {
     infoLog "[SensorDisplay] Syncing all sensor states → display"
 
-    (1..16).each { idx ->
+    (1..maxSlots()).each { idx ->
         def dev  = settings["sensor${idx}"]
         String t = settings["sensorType${idx}"] ?: "motion"
 
@@ -403,15 +409,19 @@ def syncAllSensors() {
                 settings.indicatorDevice.setMotionInactive(idx)
             }
         }
-        pauseExecution(200)
     }
 }
 
 // ── Display Reboot Handler ────────────────────────────────────────────────────
 
 def displayRebootedHandler(evt) {
-    infoLog "[SensorDisplay] SenseCAP rebooted — syncing all sensor states"
-    syncAllSensors()
+    infoLog "[SensorDisplay] SenseCAP rebooted — pushing grid, types, labels and syncing sensor states"
+    if (settings.indicatorDevice) {
+        settings.indicatorDevice.setGridLayout(settings.gridLayout ?: "2x2")
+    }
+    // Layout was already pushed by driver on reboot — just resync labels/types/states
+    runIn(2, pushLabelsAndTypes)
+    runIn(5, syncAllSensors)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -424,71 +434,12 @@ private int maxSlots() {
     }
 }
 
-/**
- * MDI icon options per sensor type.
- * Values are literal backslash-uXXXX strings — openHASP's JSON parser (via p1bN.jsonl)
- * converts them to the actual glyph. Only glyphs in the built-in MDI subset are listed.
- */
-private Map mdiOptionsFor(String type) {
-    Map common = [
-        'none'   : '(none)',
-        '\\uE026': 'Alert',
-        '\\uE09A': 'Bell',
-        '\\uE2DC': 'Home',
-        '\\uE565': 'Shield check',
-        '\\uE12C': 'Check',
-        '\\uE004': 'Account',
-    ]
-    Map typeSpecific
-    switch (type) {
-        case "contact":
-            typeSpecific = [
-                '\\uE81C': 'Door open',
-                '\\uE81B': 'Door closed',
-                '\\uEFC6': 'Lock open',
-                '\\uE33E': 'Lock',
-                '\\uF2D4': 'Garage open',
-                '\\uF2D3': 'Garage',
-            ]
-            break
-        case "water":
-            typeSpecific = [
-                '\\uE58C': 'Water',
-                '\\uE58F': 'Water pump',
-                '\\uE58E': 'Water percent',
-            ]
-            break
-        case "smoke":
-            typeSpecific = [
-                '\\uE238': 'Fire',
-                '\\uE026': 'Alert',
-                '\\uE565': 'Shield check',
-            ]
-            break
-        default: // motion
-            typeSpecific = [
-                '\\uE70E': 'Run',
-                '\\uE64A': 'Human greeting',
-                '\\uE004': 'Account',
-                '\\uE7AE': 'CCTV',
-                '\\uE68A': 'Shield home',
-            ]
-    }
-    return typeSpecific + common
-}
+
 
 /**
- * Prepends the chosen MDI icon on its own line above the wrapped label text.
- * The icon value is stored as a literal backslash-uXXXX string and passed straight
- * through to the JSON payload — openHASP decodes it to the MDI glyph.
+ * wrapLabel — word-wraps a plain label string to maxChars per line.
+ * No icon is prepended here; icons are sent separately to the overlay object.
  */
-private String buildLabel(int idx, String rawLabel, int maxChars) {
-    String icon    = settings["icon${idx}"] ?: "none"
-    String wrapped = wrapLabel(rawLabel, maxChars)
-    if (!icon || icon == "none") return wrapped
-    return "${icon}\n${wrapped}"
-}
-
 private String wrapLabel(String text, int maxChars) {
     if (text.contains("\n")) {
         return text.split("\n").collect { wrapLabel(it, maxChars) }.join("\n")
