@@ -27,19 +27,24 @@
  * SenseCAP Indicator Motion Driver
  *
  * Controls object background colors on an openHASP device (SenseCAP Indicator)
- * via MQTT. Each sensor slot (motion or contact) maps to one openHASP object.
+ * via MQTT. Each sensor slot maps to a pair of openHASP objects:
+ *
+ *   Object ID  slot * 2 - 1  (odd)  — btn  — full-tile background + centered label text
+ *   Object ID  slot * 2      (even) — label — icon only, top-left, transparent background
+ *
+ * This means slot 1 → objects 1 (btn) + 2 (icon label)
+ *              slot 2 → objects 3 (btn) + 4 (icon label)  ... etc.
+ *
+ * The icon label object sits on top of the btn with a transparent background so
+ * the btn's color shines through, while the btn's text remains fully centered
+ * without any offset for the icon.
  *
  * openHASP MQTT topic format:
- *   hasp/<nodeName>/command/p<page>b<objectId>.bg_color
- * Payload:
- *   #RRGGBB
- *
- * Sensor semantics (both handled identically at the driver level):
- *   motion  active / contact open / water wet   → colorActive   (default red)
- *   motion inactive / contact closed / water dry / smoke clear → per-type inactive color (after fade)
+ *   hasp/<nodeName>/command/p<page>b<objectId>.bg_color  →  #RRGGBB
+ *   hasp/<nodeName>/command/p<page>b<objectId>.jsonl     →  {"text":"..."}
  *
  * Author: jlslate (slate)
- * Version: 2.6.0  — fix label escape chain to pass icon sequences correctly
+ * Version: 3.0.0  — state-driven icons, setGridLayout command, activeGrid helper, optimised batch layout push
  */
 
 import groovy.transform.Field
@@ -58,15 +63,15 @@ metadata {
         command "setMotionInactive", [[name: "sensorIndex", type: "NUMBER", description: "Sensor slot 1–16 — fades tile to green"]]
         command "setAllInactive"
         command "reconnectMqtt"
+        command "setGridLayout",  [[name: "gridLayout", type: "STRING", description: "2x2, 3x3, or 4x4"]]
         command "pushLayout"
-        command "updateLabels",      [[name: "labels",      type: "JSON_OBJECT", description: "Map of sensor index to label text"]]
-        command "updateSlotTypes",   [[name: "slotTypes",   type: "JSON_OBJECT", description: "Map of sensor index to type: motion or contact"]]
+        command "updateLabels",    [[name: "labels",    type: "JSON_OBJECT", description: "Map of slot index to label text (no icon)"]]
+        command "updateSlotTypes", [[name: "slotTypes", type: "JSON_OBJECT", description: "Map of slot index to type: motion, contact, water, or smoke"]]
 
         attribute "mqttStatus",      "string"
         attribute "gridLayout",      "string"
-        attribute "displayRebooted", "string"  // fires on SenseCAP reboot — app subscribes to trigger syncAllSensors
+        attribute "displayRebooted", "string"
 
-        // Per-slot status and type attributes for all 16 slots
         attribute "sensor1Status",   "string"
         attribute "sensor2Status",   "string"
         attribute "sensor3Status",   "string"
@@ -133,26 +138,15 @@ metadata {
             required: true,
             defaultValue: "plate"
 
-        input name: "gridLayout",
-            type: "enum",
-            title: "Display Grid Layout",
-            options: [
-                "2x2": "2×2 (4 sensors)",
-                "3x3": "3×3 (9 sensors)",
-                "4x4": "4×4 (16 sensors)"
-            ],
-            defaultValue: "2x2",
-            required: true
-
         input name: "colorActive",
             type: "text",
-            title: "Active color (motion detected)",
+            title: "Active color (alert state)",
             defaultValue: "#FF0000",
             description: "Hex color e.g. #FF0000 = red"
 
         input name: "colorInactive",
             type: "text",
-            title: "Inactive color — motion sensor (no motion)",
+            title: "Inactive color — motion sensor",
             defaultValue: "#008000",
             description: "Hex color e.g. #008000 = green"
 
@@ -179,6 +173,12 @@ metadata {
             title: "Fade duration (seconds, default 30)",
             defaultValue: 30,
             required: true
+
+        input name: "iconFont",
+            type: "number",
+            title: "Icon font size (pt, default 24)",
+            defaultValue: 24,
+            description: "MDI glyph size on the icon overlay — 16, 24, or 32"
 
         input name: "backlightOnMotion",
             type: "bool",
@@ -218,6 +218,14 @@ metadata {
     }
 }
 
+// ── Object ID helpers ─────────────────────────────────────────────────────────
+//
+//   bgId(slot)   = slot       1–16   btn — bg_color + "align":"center" text
+//   iconId(slot) = slot + 16  17–32  label — page-level absolute coords, tight box
+//
+private int bgId(int slot)   { slot      }
+private int iconId(int slot) { slot + 16 }
+
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 def installed() {
@@ -233,12 +241,17 @@ def updated() {
 def initialize() {
     state.clear()
     sendEvent(name: "mqttStatus", value: "Initializing")
-    sendEvent(name: "gridLayout",  value: settings.gridLayout ?: "2x2")
+    sendEvent(name: "gridLayout",  value: activeGrid())
     connectMqtt()
-    runIn(4, pushLayout)       // push pages.jsonl first, then setAllInactive follows
-    runIn(10, setAllInactive)  // give the display time to rebuild its object tree
+    runIn(2, pushLayout)
     unschedule(sendHeartbeat)
     runEvery5Minutes(sendHeartbeat)
+}
+
+def setGridLayout(String gridLayout) {
+    state.gridLayout = gridLayout
+    sendEvent(name: "gridLayout", value: gridLayout)
+    infoLog "[SenseCAP] Grid layout set to ${gridLayout}"
 }
 
 def uninstalled() {
@@ -300,8 +313,6 @@ def parse(String description) {
     debugLog "Received: topic=${msg.topic} payload=${msg.payload}"
 
     if (msg.topic.endsWith("/LWT")) {
-        // LWT "online" is published every time the SenseCAP connects to the broker,
-        // which happens on every reboot — far more reliable than parsing statusupdate.
         if (msg.payload?.trim() == "online") {
             infoLog "[SenseCAP] LWT online — display rebooted, pushing layout and resyncing"
             runIn(2, pushLayout)
@@ -398,6 +409,7 @@ def setMotionActive(sensorIndex) {
     unschedule("fadeStep${idx}")
     state.remove("fadeStep${idx}")
     publishColor(idx, settings.colorActive ?: "#FF0000")
+    publishIcon(idx, activeIconFor(idx))
 
     if (settings.backlightOnMotion) {
         unschedule(backlightOff)
@@ -426,6 +438,7 @@ def setMotionInactive(sensorIndex) {
     if (wasActive) {
         unschedule("fadeStep${idx}")
         state["fadeStep${idx}"] = 0
+        publishIcon(idx, inactiveIconFor(idx))
         scheduleFadeStep(idx)
 
         if (settings.backlightOnMotion) {
@@ -442,6 +455,7 @@ def setMotionInactive(sensorIndex) {
         }
     } else {
         publishColor(idx, inactiveColorFor(idx))
+        publishIcon(idx, inactiveIconFor(idx))
         if (settings.backlightOnMotion) {
             unschedule(backlightOff)
             if (allInactive()) {
@@ -461,8 +475,12 @@ private int fadeInterval() {
     return Math.max(1, Math.round(secs / FADE_STEPS) as int)
 }
 
+private String activeGrid() {
+    return (state.gridLayout ?: activeGrid()) as String
+}
+
 private int maxSensors() {
-    switch (settings.gridLayout) {
+    switch (activeGrid()) {
         case "4x4": return 16
         case "3x3": return 9
         default:    return 4
@@ -542,80 +560,187 @@ private void doFadeStep(int idx) {
     }
 }
 
+
+// ── Icon codepoints (MDI built-in subset) ────────────────────────────────────
+// Active state (alert):
+@Field static final String ICON_MOTION_ACTIVE  = "\\uE026"  // mdi:alert (confirmed working)
+@Field static final String ICON_CONTACT_ACTIVE = "\\uE026"  // mdi:alert (confirmed working)
+@Field static final String ICON_WATER_ACTIVE   = "\\uE026"  // mdi:alert (confirmed working - wet/alarm)
+@Field static final String ICON_SMOKE_ACTIVE   = "\\uE026"  // mdi:alert (confirmed working - detected)
+// Inactive state (clear):
+@Field static final String ICON_MOTION_INACTIVE  = "\\uE70E"  // mdi:run (confirmed working)
+@Field static final String ICON_CONTACT_INACTIVE = "\\uE2DC"  // mdi:home (confirmed working)
+@Field static final String ICON_WATER_INACTIVE   = "\\uE58C"  // mdi:water (water drop - dry/watching)
+@Field static final String ICON_SMOKE_INACTIVE   = "\\uE238"  // mdi:fire (clear/watching)
+
+private String activeIconFor(int idx) {
+    switch (state["slotType${idx}"]) {
+        case "contact": return ICON_CONTACT_ACTIVE
+        case "water":   return ICON_WATER_ACTIVE
+        case "smoke":   return ICON_SMOKE_ACTIVE
+        default:        return ICON_MOTION_ACTIVE
+    }
+}
+
+private String inactiveIconFor(int idx) {
+    switch (state["slotType${idx}"]) {
+        case "contact": return ICON_CONTACT_INACTIVE
+        case "water":   return ICON_WATER_INACTIVE
+        case "smoke":   return ICON_SMOKE_INACTIVE
+        default:        return ICON_MOTION_INACTIVE
+    }
+}
+
+private void publishIcon(int sensorIdx, String glyph) {
+    String node  = settings.haspNode ?: "plate"
+    int    obj   = iconId(sensorIdx)
+    int    fontPt = (settings.iconFont ?: 24) as int
+    String topic = "hasp/${node}/command/p1b${obj}.jsonl"
+    String payload = "{\"text\":\"${glyph}\",\"text_font\":${fontPt}}"
+    debugLog "[SenseCAP] Icon → ${topic} : ${glyph}"
+    try {
+        interfaces.mqtt.publish(topic, payload, 1, false)
+    } catch (Exception e) {
+        infoLog "[SenseCAP] ERROR — Icon publish failed: ${e.message}"
+    }
+}
 // ── Layout push ───────────────────────────────────────────────────────────────
-
-// Each entry is one line of pages.jsonl for the matching grid layout.
-// openHASP processes these via the command/jsonl topic, one line at a time.
-// Display: SenseCAP Indicator D1, 480×480 px.
-
-@Field static final List<String> LAYOUT_2x2 = [
-    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 1","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":2,"obj":"btn","x":242,"y":2,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 2","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":3,"obj":"btn","x":2,"y":242,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 3","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":4,"obj":"btn","x":242,"y":242,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 4","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}'
+//
+// Each slot in the layout is now TWO objects:
+//
+//   Object (bgId = slot)      — "obj"  — full tile, bg_color only.
+//                                           long_mode=1 (wrap) keeps multi-line centered.
+//
+//   Object (iconId = slot + 16) — "label" — same x/y/w/h, bg_opa=0 (transparent),
+//                                           border_width=0, icon glyph only, align=0
+//                                           (left), pad_left/pad_top pin it top-left.
+//                                           Rendered after all btns so it sits on top.
+//
+@Field static final List<String> LAYOUT_2x2_BG = [
+    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":2,"obj":"btn","x":242,"y":2,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":3,"obj":"btn","x":2,"y":242,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":4,"obj":"btn","x":242,"y":242,"w":236,"h":236,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}'
+]
+@Field static final List<String> LAYOUT_2x2_ICON = [
+    '{"page":1,"id":17,"obj":"label","parentid":0,"x":8,"y":8,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":18,"obj":"label","parentid":0,"x":248,"y":8,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":19,"obj":"label","parentid":0,"x":8,"y":248,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":20,"obj":"label","parentid":0,"x":248,"y":248,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}'
+]
+@Field static final List<String> LAYOUT_3x3_BG = [
+    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":2,"obj":"btn","x":161,"y":2,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":3,"obj":"btn","x":320,"y":2,"w":158,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":4,"obj":"btn","x":2,"y":161,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":5,"obj":"btn","x":161,"y":161,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":6,"obj":"btn","x":320,"y":161,"w":158,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":7,"obj":"btn","x":2,"y":320,"w":157,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":8,"obj":"btn","x":161,"y":320,"w":157,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":9,"obj":"btn","x":320,"y":320,"w":158,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}'
+]
+@Field static final List<String> LAYOUT_3x3_ICON = [
+    '{"page":1,"id":17,"obj":"label","parentid":0,"x":8,"y":8,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":18,"obj":"label","parentid":0,"x":167,"y":8,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":19,"obj":"label","parentid":0,"x":326,"y":8,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":20,"obj":"label","parentid":0,"x":8,"y":167,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":21,"obj":"label","parentid":0,"x":167,"y":167,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":22,"obj":"label","parentid":0,"x":326,"y":167,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":23,"obj":"label","parentid":0,"x":8,"y":326,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":24,"obj":"label","parentid":0,"x":167,"y":326,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}',
+    '{"page":1,"id":25,"obj":"label","parentid":0,"x":326,"y":326,"w":36,"h":36,"bg_opa":0,"border_width":0,"text":"","text_font":24,"text_color":"black","click":false}'
+]
+@Field static final List<String> LAYOUT_4x4_BG = [
+    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":2,"obj":"btn","x":121,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":3,"obj":"btn","x":240,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":4,"obj":"btn","x":359,"y":2,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":5,"obj":"btn","x":2,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":6,"obj":"btn","x":121,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":7,"obj":"btn","x":240,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":8,"obj":"btn","x":359,"y":121,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":9,"obj":"btn","x":2,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":10,"obj":"btn","x":121,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":11,"obj":"btn","x":240,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":12,"obj":"btn","x":359,"y":240,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":13,"obj":"btn","x":2,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":14,"obj":"btn","x":121,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":15,"obj":"btn","x":240,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}',
+    '{"page":1,"id":16,"obj":"btn","x":359,"y":359,"w":119,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"","text_font":16,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":1}'
+]
+@Field static final List<String> LAYOUT_4x4_ICON = [
+    '{"page":1,"id":17,"obj":"label","parentid":0,"x":7,"y":7,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":18,"obj":"label","parentid":0,"x":126,"y":7,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":19,"obj":"label","parentid":0,"x":245,"y":7,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":20,"obj":"label","parentid":0,"x":364,"y":7,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":21,"obj":"label","parentid":0,"x":7,"y":126,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":22,"obj":"label","parentid":0,"x":126,"y":126,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":23,"obj":"label","parentid":0,"x":245,"y":126,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":24,"obj":"label","parentid":0,"x":364,"y":126,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":25,"obj":"label","parentid":0,"x":7,"y":245,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":26,"obj":"label","parentid":0,"x":126,"y":245,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":27,"obj":"label","parentid":0,"x":245,"y":245,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":28,"obj":"label","parentid":0,"x":364,"y":245,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":29,"obj":"label","parentid":0,"x":7,"y":364,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":30,"obj":"label","parentid":0,"x":126,"y":364,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":31,"obj":"label","parentid":0,"x":245,"y":364,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}',
+    '{"page":1,"id":32,"obj":"label","parentid":0,"x":364,"y":364,"w":26,"h":26,"bg_opa":0,"border_width":0,"text":"","text_font":16,"text_color":"black","click":false}'
 ]
 
-@Field static final List<String> LAYOUT_3x3 = [
-    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 1","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":2,"obj":"btn","x":161,"y":2,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 2","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":3,"obj":"btn","x":320,"y":2,"w":158,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 3","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":4,"obj":"btn","x":2,"y":161,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 4","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":5,"obj":"btn","x":161,"y":161,"w":157,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 5","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":6,"obj":"btn","x":320,"y":161,"w":158,"h":157,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 6","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":7,"obj":"btn","x":2,"y":320,"w":157,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 7","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":8,"obj":"btn","x":161,"y":320,"w":157,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 8","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":9,"obj":"btn","x":320,"y":320,"w":158,"h":158,"bg_color":"#000000","border_color":"black","border_width":4,"radius":10,"text":"Sensor 9","text_font":32,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}'
-]
-
-@Field static final List<String> LAYOUT_4x4 = [
-    '{"page":1,"id":1,"obj":"btn","x":2,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 1","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":2,"obj":"btn","x":121,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 2","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":3,"obj":"btn","x":240,"y":2,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 3","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":4,"obj":"btn","x":359,"y":2,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 4","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":5,"obj":"btn","x":2,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 5","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":6,"obj":"btn","x":121,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 6","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":7,"obj":"btn","x":240,"y":121,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 7","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":8,"obj":"btn","x":359,"y":121,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 8","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":9,"obj":"btn","x":2,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 9","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":10,"obj":"btn","x":121,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 10","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":11,"obj":"btn","x":240,"y":240,"w":117,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 11","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":12,"obj":"btn","x":359,"y":240,"w":119,"h":117,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 12","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":13,"obj":"btn","x":2,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 13","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":14,"obj":"btn","x":121,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 14","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":15,"obj":"btn","x":240,"y":359,"w":117,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 15","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}',
-    '{"page":1,"id":16,"obj":"btn","x":359,"y":359,"w":119,"h":119,"bg_color":"#000000","border_color":"black","border_width":3,"radius":8,"text":"Sensor 16","text_font":24,"align":"center","text_color":"black","toggle":false,"click":false,"long_mode":0}'
-]
-
-/**
- * pushLayout — publishes the pages.jsonl layout for the selected grid to the
- * SenseCAP display over MQTT using openHASP's command/jsonl topic.
- * Called automatically on initialize(); can also be triggered manually from
- * the device Commands panel after changing the grid layout preference.
- */
 def pushLayout() {
-    String node = settings.haspNode ?: "plate"
+    String node  = settings.haspNode ?: "plate"
     String topic = "hasp/${node}/command/jsonl"
 
-    List<String> lines
-    switch (settings.gridLayout) {
-        case "4x4": lines = LAYOUT_4x4; break
-        case "3x3": lines = LAYOUT_3x3; break
-        default:    lines = LAYOUT_2x2; break
+    List<String> bgs, icons
+    switch (activeGrid()) {
+        case "4x4": bgs = LAYOUT_4x4_BG; icons = LAYOUT_4x4_ICON; break
+        case "3x3": bgs = LAYOUT_3x3_BG; icons = LAYOUT_3x3_ICON; break
+        default:    bgs = LAYOUT_2x2_BG; icons = LAYOUT_2x2_ICON; break
     }
 
-    infoLog "[SenseCAP] Pushing ${settings.gridLayout} layout (${lines.size()} objects) → ${topic}"
+    infoLog "[SenseCAP] Pushing ${activeGrid()} layout (${bgs.size() + icons.size()} objects) → ${topic}"
     try {
-        lines.each { line ->
-            interfaces.mqtt.publish(topic, line, 1, false)
-            pauseExecution(80)  // give openHASP time to parse each object
-        }
+        // Clear page 1 before pushing new layout so stale objects from a
+        // previous grid size don't remain visible underneath the new tiles
+        interfaces.mqtt.publish("hasp/${node}/command/clearpage", "1", 1, false)
+        pauseExecution(300)
+        publishBatch(topic, bgs)
+        publishBatch(topic, icons)
         infoLog "[SenseCAP] Layout push complete"
+        // Layout is pushed blank — the app's initialize() will push types,
+        // labels and sync sensor states on its own schedule
     } catch (Exception e) {
         infoLog "[SenseCAP] ERROR — Layout push failed: ${e.message}"
     }
 }
 
-// ── Labels & Resync ───────────────────────────────────────────────────────────
+/**
+ * publishBatch — splits a list of JSONL lines into ≤1800-byte chunks and
+ * publishes each chunk as a single newline-delimited MQTT payload.
+ * Stays well under openHASP's 2048-byte MQTT receive buffer limit.
+ */
+private void publishBatch(String topic, List<String> lines) {
+    String node = settings.haspNode ?: "plate"
+    List<String> chunk = []
+    int chunkSize = 0
+    lines.each { line ->
+        int lineSize = line.getBytes("UTF-8").length + 1  // +1 for newline
+        if (chunkSize + lineSize > 1800 && chunk) {
+            interfaces.mqtt.publish(topic, chunk.join("\n"), 1, false)
+            pauseExecution(150)
+            chunk = []
+            chunkSize = 0
+        }
+        chunk << line
+        chunkSize += lineSize
+    }
+    if (chunk) {
+        interfaces.mqtt.publish(topic, chunk.join("\n"), 1, false)
+        pauseExecution(150)
+    }
+}
+
+// ── Labels, Icons & Resync ────────────────────────────────────────────────────
 
 def fireDisplayRebooted() {
     infoLog "[SenseCAP] Firing displayRebooted event — app will sync sensor states"
@@ -624,36 +749,61 @@ def fireDisplayRebooted() {
 
 def resyncLabels() {
     if (state.labels) updateLabels(state.labels)
+    resyncIcons()
 }
 
+/**
+ * updateLabels — publishes centered label text to each btn object.
+ * Map format: [ 1: "Living room", 2: "Front door", ... ]
+ */
 def updateLabels(Map labels) {
     String node = settings.haspNode ?: "plate"
     state.labels = labels
     debugLog "Updating labels: ${labels}"
-    labels.each { idx, text ->
-        String topic = "hasp/${node}/command/p1b${idx}.jsonl"
-        // Escape only what JSON requires: quotes and real newlines.
-        // Do NOT escape backslashes globally — icon sequences (backslash + uXXXX) and \n
-        // must reach the JSON payload as-is so openHASP/LVGL can decode them.
-        String escaped = text.toString()
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-        String payload = "{\"text\":\"${escaped}\"}"
-        try {
+    try {
+        String batch = labels.collect { idx, text ->
+            int obj = bgId(idx as int)
+            String escaped = text.toString()
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+            "{\"p1b${obj}.text\":\"${escaped}\",\"p1b${obj}.align\":\"center\"}"
+        }.join("\n")
+        // Use the command/update topic which accepts property key:value pairs
+        // Fall back to individual jsonl publishes if batch update not available
+        labels.each { idx, text ->
+            int obj = bgId(idx as int)
+            String escaped = text.toString()
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+            String topic   = "hasp/${node}/command/p1b${obj}.jsonl"
+            String payload = "{\"text\":\"${escaped}\",\"align\":\"center\"}"
             interfaces.mqtt.publish(topic, payload, 1, false)
-            pauseExecution(100)
-        } catch (Exception e) {
-            infoLog "[SenseCAP] ERROR — label publish failed for slot ${idx}: ${e.message}"
         }
+        debugLog "Labels updated (${labels.size()} slots)"
+    } catch (Exception e) {
+        infoLog "[SenseCAP] ERROR — label update failed: ${e.message}"
+    }
+}
+
+
+/**
+ * resyncIcons — publishes the correct icon for every slot based on current
+ * sensor state. Called after layout push and on display reboot. Does NOT
+ * store anything in state — icons are always derived fresh from sensor state
+ * and slot type, so stale stored values can never cause a flash.
+ */
+def resyncIcons() {
+    debugLog "resyncIcons — repainting ${maxSensors()} icon slots"
+    (1..maxSensors()).each { idx ->
+        String currentState = state["sensor${idx}"] ?: "inactive"
+        String glyph = (currentState == "active") ? activeIconFor(idx) : inactiveIconFor(idx)
+        publishIcon(idx, glyph)
     }
 }
 
 /**
- * updateSlotTypes — called by the app on initialize() so the driver knows
- * whether each slot is a "motion", "contact", or "water" sensor. Storing the
- * type before resyncing colors ensures contact slots show cyan and water slots
- * show blue from the moment the app saves — even after a hub reboot that clears
- * state via initialize().
+ * updateSlotTypes — records sensor type per slot so the driver uses the correct
+ * inactive color. Triggers a color resync once types are stored.
  * Map format: [ 1: "motion", 2: "contact", 3: "water", ... ]
  */
 def updateSlotTypes(Map slotTypes) {
@@ -662,16 +812,12 @@ def updateSlotTypes(Map slotTypes) {
         state["slotType${idx}"] = type
         sendEvent(name: "sensor${idx}Type", value: type)
     }
-    // Resync colors now that types are known — corrects any slots that were
-    // painted with the wrong inactive color before types arrived.
-    resyncStates()
+    // resyncStates() intentionally omitted — syncAllSensors (called by app
+    // after pushLayout completes) handles color+icon sync in the correct order.
 }
 
 def setAllInactive() {
-    (1..maxSensors()).each { idx ->
-        setMotionInactive(idx)
-        pauseExecution(150)
-    }
+    (1..maxSensors()).each { idx -> setMotionInactive(idx) }
 }
 
 def resyncStates() {
@@ -679,14 +825,16 @@ def resyncStates() {
         String currentState = state["sensor${idx}"] ?: "inactive"
         if (currentState == "active") {
             publishColor(idx, settings.colorActive ?: "#FF0000")
+            publishIcon(idx, activeIconFor(idx))
         } else if (state["fadeStep${idx}"] != null) {
             int step = (state["fadeStep${idx}"] ?: 0) as int
             int red  = Math.round(255.0 * (1.0 - (step / FADE_STEPS as double))) as int
             publishColor(idx, sprintf("#%02X0000", Math.max(0, Math.min(255, red))))
+            publishIcon(idx, inactiveIconFor(idx))
         } else {
             publishColor(idx, inactiveColorFor(idx))
+            publishIcon(idx, inactiveIconFor(idx))
         }
-        pauseExecution(150)
     }
 }
 
@@ -738,7 +886,7 @@ def motionTimeoutBacklightOff() {
             runIn(mins * 60, extendedMotionBacklightOn)
         }
     } else {
-        debugLog "motionTimeoutBacklightOff skipped — no sensors truly active (may be fading)"
+        debugLog "motionTimeoutBacklightOff skipped — no sensors truly active"
     }
 }
 
@@ -782,11 +930,16 @@ private String inactiveColorFor(int idx) {
     }
 }
 
+/**
+ * publishColor — sends bg_color to the bg obj for the given slot.
+ * Text and icon label children have bg_opa=0 so they never need color updates.
+ */
 private void publishColor(int sensorIdx, String colorHex) {
     int    page  = 1
     String node  = settings.haspNode ?: "plate"
     String color = colorHex.startsWith("#") ? colorHex : "#${colorHex}"
-    String topic = "hasp/${node}/command/p${page}b${sensorIdx}.bg_color"
+    int    obj   = bgId(sensorIdx)
+    String topic = "hasp/${node}/command/p${page}b${obj}.bg_color"
     debugLog "Publish → ${topic} : ${color}"
     try {
         interfaces.mqtt.publish(topic, color, 1, false)
