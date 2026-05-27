@@ -1,0 +1,524 @@
+/*
+ * This is free and unencumbered software released into the public domain.
+ *
+ * Anyone is free to copy, modify, publish, use, compile, sell, or
+ * distribute this software, either in source code form or as a compiled
+ * binary, for any purpose, commercial or non-commercial, and by any means.
+ *
+ * In jurisdictions that recognize copyright laws, the author or authors
+ * of this software dedicate any and all copyright interest in the software
+ * to the public domain. We make this dedication for the benefit of the
+ * public at large and to the detriment of our heirs and successors. We
+ * intend this dedication to be an overt act of relinquishment in perpetuity
+ * of all present and future rights to this software under copyright law.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+ * OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+ * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * For more information, please refer to <https://unlicense.org>
+ */
+
+/**
+ * SenseCAP Indicator Motion App
+ *
+ * Links up to 16 Hubitat motion, contact, water, or smoke sensors to a SenseCAP Indicator display.
+ *
+ * Motion sensor:   active    → RED  |  inactive  → fades to GREEN
+ * Contact sensor:  open      → RED  |  closed    → fades to CYAN
+ * Water sensor:    wet       → RED  |  dry       → fades to BLUE
+ * Smoke sensor:    detected  → RED  |  clear     → fades to YELLOW
+ *
+ * Author: jlslate (slate)
+ * Version: 2.3.0  — fix icon codepoints to confirmed openHASP built-in subset
+ */
+
+definition(
+    name: "SenseCAP Indicator Motion",
+    namespace: "community",
+    author: "jlslate (slate)",
+    description: "Shows motion, contact, water, and smoke sensor states on a SenseCAP Indicator display via MQTT",
+    category: "Integration",
+    iconUrl: "",
+    iconX2Url: "",
+    singleInstance: false
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "SenseCAP Indicator MQTT simplified", install: true, uninstall: true) {
+
+        section("<b>App Name</b>") {
+            label title: "Rename this app (optional)", required: false
+        }
+
+        section("<b>SenseCAP Indicator Device</b>") {
+            input name: "indicatorDevice",
+                type: "capability.actuator",
+                title: "Select your SenseCAP Indicator device",
+                required: true,
+                multiple: false
+        }
+
+        section("<b>Display Layout</b>") {
+            input name: "gridLayout",
+                type: "enum",
+                title: "Grid Layout",
+                options: [
+                    "2x2": "2×2 (4 sensors)",
+                    "3x3": "3×3 (9 sensors)",
+                    "4x4": "4×4 (16 sensors)"
+                ],
+                defaultValue: "2x2",
+                required: true,
+                submitOnChange: true
+        }
+
+        int maxSlots = maxSlots()
+
+        section("<b>Sensor → Display Object Mapping</b>") {
+            paragraph "For each slot choose the sensor type, assign a device, and set a label."
+
+            (1..maxSlots).each { idx ->
+                String typeKey = "sensorType${idx}"
+                String type    = settings[typeKey] ?: "motion"
+
+                paragraph "<hr><b>Slot ${idx}</b>", width: 12
+
+                input name: typeKey,
+                    type: "enum",
+                    title: "Slot ${idx} — Sensor Type",
+                    options: ["motion": "Motion sensor", "contact": "Contact sensor", "water": "Water sensor", "smoke": "Smoke sensor"],
+                    defaultValue: "motion",
+                    required: true,
+                    submitOnChange: true,
+                    width: 4
+
+                if (type == "contact") {
+                    input name: "sensor${idx}",
+                        type: "capability.contactSensor",
+                        title: "Slot ${idx} — Contact Sensor",
+                        required: false,
+                        multiple: false,
+                        width: 4
+                } else if (type == "water") {
+                    input name: "sensor${idx}",
+                        type: "capability.waterSensor",
+                        title: "Slot ${idx} — Water Sensor",
+                        required: false,
+                        multiple: false,
+                        width: 4
+                } else if (type == "smoke") {
+                    input name: "sensor${idx}",
+                        type: "capability.smokeDetector",
+                        title: "Slot ${idx} — Smoke Sensor",
+                        required: false,
+                        multiple: false,
+                        width: 4
+                } else {
+                    input name: "sensor${idx}",
+                        type: "capability.motionSensor",
+                        title: "Slot ${idx} — Motion Sensor",
+                        required: false,
+                        multiple: false,
+                        width: 4
+                }
+
+                input name: "label${idx}",
+                    type: "text",
+                    title: "Slot ${idx} — Label",
+                    defaultValue: "Sensor ${idx}",
+                    required: false,
+                    width: 3
+
+                input name: "icon${idx}",
+                    type: "enum",
+                    title: "Slot ${idx} — Icon",
+                    options: mdiOptionsFor(type),
+                    defaultValue: "none",
+                    required: false,
+                    submitOnChange: false,
+                    width: 3
+            }
+        }
+
+        section("<b>Options</b>") {
+            input name: "syncOnStartup",
+                type: "bool",
+                title: "Sync all sensor states to display on startup / save",
+                defaultValue: true,
+                description: "Recommended — keeps display accurate after a hub reboot"
+
+            input name: "logLevel",
+                type: "enum",
+                title: "Logging Level",
+                options: [
+                    "0": "None",
+                    "1": "Info only",
+                    "2": "Info + Debug"
+                ],
+                defaultValue: "1",
+                required: true
+        }
+
+        section("<b>Status</b>") {
+            paragraph "Sensors configured: <b>${subscribedCount()}</b>"
+            if (indicatorDevice) {
+                paragraph "Indicator MQTT status: <b>${indicatorDevice.currentValue('mqttStatus') ?: 'unknown'}</b>"
+            }
+        }
+    }
+}
+
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
+def installed() {
+    infoLog "[SensorDisplay] Installed"
+    initialize()
+}
+
+def updated() {
+    infoLog "[SensorDisplay] Updated"
+    unsubscribe()
+    initialize()
+}
+
+def uninstalled() {
+    unsubscribe()
+}
+
+def initialize() {
+    (1..16).each { idx ->
+        def dev  = settings["sensor${idx}"]
+        String t = settings["sensorType${idx}"] ?: "motion"
+        if (dev) {
+            if (t == "contact") {
+                subscribe(dev, "contact", "contactHandler${idx}")
+            } else if (t == "water") {
+                subscribe(dev, "water", "waterHandler${idx}")
+            } else if (t == "smoke") {
+                subscribe(dev, "smoke", "smokeHandler${idx}")
+            } else {
+                subscribe(dev, "motion", "motionHandler${idx}")
+            }
+        }
+    }
+
+    if (settings.syncOnStartup) {
+        runIn(6, syncAllSensors)
+    }
+
+    // Push labels and slot types to display
+    if (settings.indicatorDevice) {
+        int maxChars = (settings.gridLayout == "4x4") ? 7 : (settings.gridLayout == "3x3") ? 11 : 16
+        def labels    = [:]
+        def slotTypes = [:]
+        (1..maxSlots()).each { idx ->
+            String raw = (settings["label${idx}"] ?: "Sensor ${idx}").toString()
+            labels[idx]    = buildLabel(idx, raw, maxChars)
+            slotTypes[idx] = settings["sensorType${idx}"] ?: "motion"
+        }
+        settings.indicatorDevice.updateLabels(labels)
+        settings.indicatorDevice.updateSlotTypes(slotTypes)
+    }
+
+    unschedule(updateInfoObjects)
+    unschedule(waitForMqttThenUpdate)
+
+    // Re-sync all sensor states whenever the SenseCAP display reboots
+    if (settings.indicatorDevice) {
+        subscribe(settings.indicatorDevice, "displayRebooted", displayRebootedHandler)
+    }
+
+    infoLog "[SensorDisplay] Initialized — ${subscribedCount()} sensor(s) subscribed"
+}
+
+// ── Motion Event Handlers ────────────────────────────────────────────────────
+
+def motionHandler1(evt)  { handleMotion(evt, 1)  }
+def motionHandler2(evt)  { handleMotion(evt, 2)  }
+def motionHandler3(evt)  { handleMotion(evt, 3)  }
+def motionHandler4(evt)  { handleMotion(evt, 4)  }
+def motionHandler5(evt)  { handleMotion(evt, 5)  }
+def motionHandler6(evt)  { handleMotion(evt, 6)  }
+def motionHandler7(evt)  { handleMotion(evt, 7)  }
+def motionHandler8(evt)  { handleMotion(evt, 8)  }
+def motionHandler9(evt)  { handleMotion(evt, 9)  }
+def motionHandler10(evt) { handleMotion(evt, 10) }
+def motionHandler11(evt) { handleMotion(evt, 11) }
+def motionHandler12(evt) { handleMotion(evt, 12) }
+def motionHandler13(evt) { handleMotion(evt, 13) }
+def motionHandler14(evt) { handleMotion(evt, 14) }
+def motionHandler15(evt) { handleMotion(evt, 15) }
+def motionHandler16(evt) { handleMotion(evt, 16) }
+
+private void handleMotion(evt, int idx) {
+    debugLog "Motion slot ${idx} (${evt.displayName}): ${evt.value}"
+    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    if (evt.value == "active") {
+        settings.indicatorDevice.setMotionActive(idx)
+    } else {
+        settings.indicatorDevice.setMotionInactive(idx)
+    }
+}
+
+// ── Contact Event Handlers ───────────────────────────────────────────────────
+
+def contactHandler1(evt)  { handleContact(evt, 1)  }
+def contactHandler2(evt)  { handleContact(evt, 2)  }
+def contactHandler3(evt)  { handleContact(evt, 3)  }
+def contactHandler4(evt)  { handleContact(evt, 4)  }
+def contactHandler5(evt)  { handleContact(evt, 5)  }
+def contactHandler6(evt)  { handleContact(evt, 6)  }
+def contactHandler7(evt)  { handleContact(evt, 7)  }
+def contactHandler8(evt)  { handleContact(evt, 8)  }
+def contactHandler9(evt)  { handleContact(evt, 9)  }
+def contactHandler10(evt) { handleContact(evt, 10) }
+def contactHandler11(evt) { handleContact(evt, 11) }
+def contactHandler12(evt) { handleContact(evt, 12) }
+def contactHandler13(evt) { handleContact(evt, 13) }
+def contactHandler14(evt) { handleContact(evt, 14) }
+def contactHandler15(evt) { handleContact(evt, 15) }
+def contactHandler16(evt) { handleContact(evt, 16) }
+
+private void handleContact(evt, int idx) {
+    debugLog "Contact slot ${idx} (${evt.displayName}): ${evt.value}"
+    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    // open → red (alert), closed → green (clear)
+    if (evt.value == "open") {
+        settings.indicatorDevice.setMotionActive(idx)
+    } else {
+        settings.indicatorDevice.setMotionInactive(idx)
+    }
+}
+
+// ── Water Event Handlers ─────────────────────────────────────────────────────
+
+def waterHandler1(evt)  { handleWater(evt, 1)  }
+def waterHandler2(evt)  { handleWater(evt, 2)  }
+def waterHandler3(evt)  { handleWater(evt, 3)  }
+def waterHandler4(evt)  { handleWater(evt, 4)  }
+def waterHandler5(evt)  { handleWater(evt, 5)  }
+def waterHandler6(evt)  { handleWater(evt, 6)  }
+def waterHandler7(evt)  { handleWater(evt, 7)  }
+def waterHandler8(evt)  { handleWater(evt, 8)  }
+def waterHandler9(evt)  { handleWater(evt, 9)  }
+def waterHandler10(evt) { handleWater(evt, 10) }
+def waterHandler11(evt) { handleWater(evt, 11) }
+def waterHandler12(evt) { handleWater(evt, 12) }
+def waterHandler13(evt) { handleWater(evt, 13) }
+def waterHandler14(evt) { handleWater(evt, 14) }
+def waterHandler15(evt) { handleWater(evt, 15) }
+def waterHandler16(evt) { handleWater(evt, 16) }
+
+private void handleWater(evt, int idx) {
+    debugLog "Water slot ${idx} (${evt.displayName}): ${evt.value}"
+    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    // wet → red (alert), dry → green (clear)
+    if (evt.value == "wet") {
+        settings.indicatorDevice.setMotionActive(idx)
+    } else {
+        settings.indicatorDevice.setMotionInactive(idx)
+    }
+}
+
+// ── Smoke Event Handlers ─────────────────────────────────────────────────────
+
+def smokeHandler1(evt)  { handleSmoke(evt, 1)  }
+def smokeHandler2(evt)  { handleSmoke(evt, 2)  }
+def smokeHandler3(evt)  { handleSmoke(evt, 3)  }
+def smokeHandler4(evt)  { handleSmoke(evt, 4)  }
+def smokeHandler5(evt)  { handleSmoke(evt, 5)  }
+def smokeHandler6(evt)  { handleSmoke(evt, 6)  }
+def smokeHandler7(evt)  { handleSmoke(evt, 7)  }
+def smokeHandler8(evt)  { handleSmoke(evt, 8)  }
+def smokeHandler9(evt)  { handleSmoke(evt, 9)  }
+def smokeHandler10(evt) { handleSmoke(evt, 10) }
+def smokeHandler11(evt) { handleSmoke(evt, 11) }
+def smokeHandler12(evt) { handleSmoke(evt, 12) }
+def smokeHandler13(evt) { handleSmoke(evt, 13) }
+def smokeHandler14(evt) { handleSmoke(evt, 14) }
+def smokeHandler15(evt) { handleSmoke(evt, 15) }
+def smokeHandler16(evt) { handleSmoke(evt, 16) }
+
+private void handleSmoke(evt, int idx) {
+    debugLog "Smoke slot ${idx} (${evt.displayName}): ${evt.value}"
+    if (!settings.indicatorDevice) { infoLog "[SensorDisplay] WARN — No Indicator device configured"; return }
+    // detected → red (alert), clear → yellow (all clear)
+    if (evt.value == "detected") {
+        settings.indicatorDevice.setMotionActive(idx)
+    } else {
+        settings.indicatorDevice.setMotionInactive(idx)
+    }
+}
+
+// ── Sync ─────────────────────────────────────────────────────────────────────
+
+def syncAllSensors() {
+    infoLog "[SensorDisplay] Syncing all sensor states → display"
+
+    (1..16).each { idx ->
+        def dev  = settings["sensor${idx}"]
+        String t = settings["sensorType${idx}"] ?: "motion"
+
+        if (!dev) {
+            settings.indicatorDevice?.setMotionInactive(idx)
+        } else if (t == "contact") {
+            String st = dev.currentValue("contact") ?: "closed"
+            debugLog "Sync slot ${idx} contact (${dev.displayName}) = ${st}"
+            if (st == "open") {
+                settings.indicatorDevice.setMotionActive(idx)
+            } else {
+                settings.indicatorDevice.setMotionInactive(idx)
+            }
+        } else if (t == "water") {
+            String st = dev.currentValue("water") ?: "dry"
+            debugLog "Sync slot ${idx} water (${dev.displayName}) = ${st}"
+            if (st == "wet") {
+                settings.indicatorDevice.setMotionActive(idx)
+            } else {
+                settings.indicatorDevice.setMotionInactive(idx)
+            }
+        } else if (t == "smoke") {
+            String st = dev.currentValue("smoke") ?: "clear"
+            debugLog "Sync slot ${idx} smoke (${dev.displayName}) = ${st}"
+            if (st == "detected") {
+                settings.indicatorDevice.setMotionActive(idx)
+            } else {
+                settings.indicatorDevice.setMotionInactive(idx)
+            }
+        } else {
+            String st = dev.currentValue("motion") ?: "inactive"
+            debugLog "Sync slot ${idx} motion (${dev.displayName}) = ${st}"
+            if (st == "active") {
+                settings.indicatorDevice.setMotionActive(idx)
+            } else {
+                settings.indicatorDevice.setMotionInactive(idx)
+            }
+        }
+        pauseExecution(200)
+    }
+}
+
+// ── Display Reboot Handler ────────────────────────────────────────────────────
+
+def displayRebootedHandler(evt) {
+    infoLog "[SensorDisplay] SenseCAP rebooted — syncing all sensor states"
+    syncAllSensors()
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+private int maxSlots() {
+    switch (settings.gridLayout) {
+        case "4x4": return 16
+        case "3x3": return 9
+        default:    return 4
+    }
+}
+
+/**
+ * MDI icon options per sensor type.
+ * Values are literal backslash-uXXXX strings — openHASP's JSON parser (via p1bN.jsonl)
+ * converts them to the actual glyph. Only glyphs in the built-in MDI subset are listed.
+ */
+private Map mdiOptionsFor(String type) {
+    Map common = [
+        'none'   : '(none)',
+        '\\uE026': 'Alert',
+        '\\uE09A': 'Bell',
+        '\\uE2DC': 'Home',
+        '\\uE565': 'Shield check',
+        '\\uE12C': 'Check',
+        '\\uE004': 'Account',
+    ]
+    Map typeSpecific
+    switch (type) {
+        case "contact":
+            typeSpecific = [
+                '\\uE81C': 'Door open',
+                '\\uE81B': 'Door closed',
+                '\\uEFC6': 'Lock open',
+                '\\uE33E': 'Lock',
+                '\\uF2D4': 'Garage open',
+                '\\uF2D3': 'Garage',
+            ]
+            break
+        case "water":
+            typeSpecific = [
+                '\\uE58C': 'Water',
+                '\\uE58F': 'Water pump',
+                '\\uE58E': 'Water percent',
+            ]
+            break
+        case "smoke":
+            typeSpecific = [
+                '\\uE238': 'Fire',
+                '\\uE026': 'Alert',
+                '\\uE565': 'Shield check',
+            ]
+            break
+        default: // motion
+            typeSpecific = [
+                '\\uE70E': 'Run',
+                '\\uE64A': 'Human greeting',
+                '\\uE004': 'Account',
+                '\\uE7AE': 'CCTV',
+                '\\uE68A': 'Shield home',
+            ]
+    }
+    return typeSpecific + common
+}
+
+/**
+ * Prepends the chosen MDI icon on its own line above the wrapped label text.
+ * The icon value is stored as a literal backslash-uXXXX string and passed straight
+ * through to the JSON payload — openHASP decodes it to the MDI glyph.
+ */
+private String buildLabel(int idx, String rawLabel, int maxChars) {
+    String icon    = settings["icon${idx}"] ?: "none"
+    String wrapped = wrapLabel(rawLabel, maxChars)
+    if (!icon || icon == "none") return wrapped
+    return "${icon}\n${wrapped}"
+}
+
+private String wrapLabel(String text, int maxChars) {
+    if (text.contains("\n")) {
+        return text.split("\n").collect { wrapLabel(it, maxChars) }.join("\n")
+    }
+    if (text.length() <= maxChars) return text
+    List<String> words = text.split(" ") as List
+    List<String> lines = []
+    String current = ""
+    words.each { word ->
+        if (current.isEmpty()) {
+            current = word
+        } else if ((current + " " + word).length() <= maxChars) {
+            current += " " + word
+        } else {
+            lines << current
+            current = word
+        }
+    }
+    if (current) lines << current
+    return lines.join("\n")
+}
+
+private int subscribedCount() {
+    (1..16).count { settings["sensor${it}"] != null }
+}
+
+private void infoLog(String msg) {
+    if ((settings.logLevel ?: "1") != "0") log.info msg
+}
+
+private void debugLog(String msg) {
+    if ((settings.logLevel ?: "1") == "2") log.debug msg
+}
