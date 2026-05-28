@@ -1,10 +1,10 @@
 {
   "packageName": "OpenCAP Sensor Monitor",
   "author": "jlslate (slate)",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "minimumHEVersion": "2.3.0",
   "dateReleased": "2026-05-27",
-  "releaseNotes": "v3.0.0: State-driven icons per sensor type, color picker with 15 color palette, active-to-inactive color fade interpolation, single grid setting in app, optimised batched MQTT layout push, automatic text color contrast (black/white) based on tile background luminance.",
+  "releaseNotes": "v3.1.0: Grid sizes 1x1 through 7x7 (1-49 sensors). Empty slot support \u2014 set type to \"No sensor\" for a slate background tile. Sensor displayName used as default label with emoji stripping. Letter icons (M/C/W/S) for 6x6 and 7x7 dense grids. Active-to-inactive color fade interpolation. 15-color palette for all tile colors. Luminance-based text color contrast.",
   "documentationLink": "https://github.com/jlslate/OpenCAP-Sensor-Monitor/blob/main/README.md",
   "communityLink": "",
   "apps": [
