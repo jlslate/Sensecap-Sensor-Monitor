@@ -1,6 +1,12 @@
 # SenseCAP Sensor Monitor for Hubitat
 
-### This project allows you to display either a 2x2 or 3x3 or 4x4 grid of sensors from a Hubitat hub onto a SenseCAP Indicator D1 configured with OpenHASP firmware.
+### This project allows you to display either a 2x2, 3x3, or 4x4 grid of sensors from a Hubitat hub onto a SenseCAP Indicator D1 configured with OpenHASP firmware.
+
+## Requirements
+
+- Hubitat Elevation hub
+- SenseCAP Indicator D1 (480×480, running openHASP 0.7+)
+- MQTT broker (Hubitat's built-in broker works)
 
 ### Here are the brief instructions:
   - Hubitat - install and configure MQTT Export Integration
@@ -68,16 +74,21 @@
   - Enter _hubitat_ for the **MQTT Username**
   - Enter the password from the MQTT app for **MQTT Password**
   - Change the **openHASP Node Name** if you changed it on the SenseCAP
-  - Choose the **Set Grid Layout** that corresponds to the layout you chose
+  - Choose the **Active color** from the list
+  - For each sensor type choose the **Inactive color**
+  - Modify any of the other fields as required and select **Save**
   - Select **Save** and then select **Commands**
+  - Choose the **Set Grid Layout** that corresponds to the layout you chose
+  - Select **Reconnect Mqtt**
   - You should see _Connected_ on the **Mqtt Status** and on the serial port connection, messages like _MQTT RCV: p1b1.bg_color = #008000_
 
 ## Install and Configure the app
   - On the Hubitat hub, select **Apps** and then **+ Add user app**
   - Choose _SenseCAP Indicator Motion_
   - Choose the Device you created on the **Select your SenseCAP Indicator device** and select **Update**
-  - For each slot, select a 
-  - Assign a motion sensor to each of the sensor slots and select **Done**
+  - Choose the **Grid Layout** you want
+  - For each slot, choose the **Sensor Type**, the device you wnat to use, and the **Label**
+  - Select **Done**
 
 # You should now see motion on the SenseCAP
 
@@ -85,33 +96,6 @@
 
 
 
-
-
-
-
-
-# OpenCAP Sensor Monitor
-
-Displays up to 16 Hubitat sensors on a [SenseCAP Indicator](https://www.seeedstudio.com/SenseCAP-Indicator-D1-p-5643.html) running [openHASP](https://openhasp.haswitchplate.com/) via MQTT.
-
-## What it does
-
-Each sensor gets a color-coded tile with a label and a state-driven icon:
-
-| Sensor type | Inactive (clear) | Active (alert) |
-|---|---|---|
-| Motion | Green — run icon | Red → fades to green |
-| Contact | Cyan — home icon | Red — alert icon |
-| Water / leak | Blue — water icon | Red — alert icon |
-| Smoke | Yellow — fire icon | Red — alert icon |
-
-Icons update automatically when sensor state changes. No manual icon selection needed.
-
-## Requirements
-
-- Hubitat Elevation hub
-- SenseCAP Indicator D1 (480×480, running openHASP 0.7+)
-- MQTT broker (Hubitat's built-in broker works)
 
 ## Installation
 
