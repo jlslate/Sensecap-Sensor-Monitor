@@ -24,7 +24,7 @@
  */
 
 /**
- * SenseCAP Indicator Motion Driver
+ * SenseCAP Sensor Monitor Driver
  *
  * Controls object background colors on an openHASP device (SenseCAP Indicator)
  * via MQTT. Each sensor slot maps to a pair of openHASP objects:
@@ -51,16 +51,16 @@ import groovy.transform.Field
 
 metadata {
     definition(
-        name: "SenseCAP Indicator Motion",
+        name: "SenseCAP Sensor Monitor",
         namespace: "community",
         author: "jlslate (slate)",
-        description: "openHASP MQTT driver — motion sensor color display on SenseCAP Indicator"
+        description: "Sensecap Sensor Monitor driver - motion sensor color display on SenseCAP Indicator"
     ) {
         capability "Initialize"
         capability "Actuator"
 
-        command "setMotionActive",   [[name: "sensorIndex", type: "NUMBER", description: "Sensor slot 1–16 — turns tile red"]]
-        command "setMotionInactive", [[name: "sensorIndex", type: "NUMBER", description: "Sensor slot 1–16 — fades tile to green"]]
+        command "setMotionActive",   [[name: "sensorIndex", type: "NUMBER", description: "Sensor slot 1–16 — turns tile to active state"]]
+        command "setMotionInactive", [[name: "sensorIndex", type: "NUMBER", description: "Sensor slot 1–16 — turns tile to inactive state"]]
         command "setAllInactive"
         command "reconnectMqtt"
         command "setGridLayout",  [[name: "gridLayout", type: "STRING", description: "2x2, 3x3, or 4x4"]]
@@ -139,34 +139,112 @@ metadata {
             defaultValue: "plate"
 
         input name: "colorActive",
-            type: "text",
+            type: "enum",
             title: "Active color (alert state)",
+            options: [
+                "#FF0000": "Red",
+                "#FF4500": "Orange-red",
+                "#FF8C00": "Dark orange",
+                "#FF1493": "Deep pink",
+                "#8B0000": "Dark red",
+                "#FF6347": "Tomato",
+                "#DC143C": "Crimson",
+                "#FF0080": "Hot magenta"
+            ],
             defaultValue: "#FF0000",
-            description: "Hex color e.g. #FF0000 = red"
+            required: true
 
         input name: "colorInactive",
-            type: "text",
+            type: "enum",
             title: "Inactive color — motion sensor",
+            options: [
+                "#F8F8FF": "Ghost White",
+                "#D3D3D3": "Light Gray",
+                "#808080": "Gray",
+                "#FF0000": "Red",
+                "#800000": "Maroon",
+                "#FF00FF": "Magenta",
+                "#800080": "Purple",
+                "#0000FF": "Blue",
+                "#000080": "Navy",
+                "#00FFFF": "Cyan",
+                "#008080": "Teal",
+                "#00FF00": "Lime",
+                "#008000": "Green",
+                "#FFFF00": "Yellow",
+                "#808000": "Olive"
+            ],
             defaultValue: "#008000",
-            description: "Hex color e.g. #008000 = green"
+            required: true
 
         input name: "colorContactInactive",
-            type: "text",
+            type: "enum",
             title: "Inactive color — contact sensor (closed)",
+            options: [
+                "#F8F8FF": "Ghost White",
+                "#D3D3D3": "Light Gray",
+                "#808080": "Gray",
+                "#FF0000": "Red",
+                "#800000": "Maroon",
+                "#FF00FF": "Magenta",
+                "#800080": "Purple",
+                "#0000FF": "Blue",
+                "#000080": "Navy",
+                "#00FFFF": "Cyan",
+                "#008080": "Teal",
+                "#00FF00": "Lime",
+                "#008000": "Green",
+                "#FFFF00": "Yellow",
+                "#808000": "Olive"
+            ],
             defaultValue: "#00FFFF",
-            description: "Hex color e.g. #00FFFF = cyan"
+            required: true
 
         input name: "colorWaterInactive",
-            type: "text",
+            type: "enum",
             title: "Inactive color — water sensor (dry)",
+            options: [
+                "#F8F8FF": "Ghost White",
+                "#D3D3D3": "Light Gray",
+                "#808080": "Gray",
+                "#FF0000": "Red",
+                "#800000": "Maroon",
+                "#FF00FF": "Magenta",
+                "#800080": "Purple",
+                "#0000FF": "Blue",
+                "#000080": "Navy",
+                "#00FFFF": "Cyan",
+                "#008080": "Teal",
+                "#00FF00": "Lime",
+                "#008000": "Green",
+                "#FFFF00": "Yellow",
+                "#808000": "Olive"
+            ],
             defaultValue: "#0000FF",
-            description: "Hex color e.g. #0000FF = blue"
+            required: true
 
         input name: "colorSmokeInactive",
-            type: "text",
+            type: "enum",
             title: "Inactive color — smoke sensor (clear)",
+            options: [
+                "#F8F8FF": "Ghost White",
+                "#D3D3D3": "Light Gray",
+                "#808080": "Gray",
+                "#FF0000": "Red",
+                "#800000": "Maroon",
+                "#FF00FF": "Magenta",
+                "#800080": "Purple",
+                "#0000FF": "Blue",
+                "#000080": "Navy",
+                "#00FFFF": "Cyan",
+                "#008080": "Teal",
+                "#00FF00": "Lime",
+                "#008000": "Green",
+                "#FFFF00": "Yellow",
+                "#808000": "Olive"
+            ],
             defaultValue: "#FFFF00",
-            description: "Hex color e.g. #FFFF00 = yellow"
+            required: true
 
         input name: "fadeDuration",
             type: "number",
@@ -408,7 +486,9 @@ def setMotionActive(sensorIndex) {
 
     unschedule("fadeStep${idx}")
     state.remove("fadeStep${idx}")
-    publishColor(idx, settings.colorActive ?: "#FF0000")
+    String activeColor = settings.colorActive ?: "#FF0000"
+    publishColor(idx, activeColor)
+    publishTextColor(idx, activeColor)
     publishIcon(idx, activeIconFor(idx))
 
     if (settings.backlightOnMotion) {
@@ -454,7 +534,9 @@ def setMotionInactive(sensorIndex) {
             }
         }
     } else {
-        publishColor(idx, inactiveColorFor(idx))
+        String iColor = inactiveColorFor(idx)
+        publishColor(idx, iColor)
+        publishTextColor(idx, iColor)
         publishIcon(idx, inactiveIconFor(idx))
         if (settings.backlightOnMotion) {
             unschedule(backlightOff)
@@ -533,10 +615,22 @@ private void doFadeStep(int idx) {
 
     int step     = (state["fadeStep${idx}"] ?: 0) as int
     int maxSteps = FADE_STEPS
+    double t     = step / (maxSteps as double)  // 0.0 = fully active, 1.0 = fully inactive
 
-    int red  = Math.round(255.0 * (1.0 - (step / maxSteps as double))) as int
-    red      = Math.max(0, Math.min(255, red))
-    String hex = sprintf("#%02X0000", red)
+    // Interpolate from active color to inactive color across FADE_STEPS
+    String fromHex = (settings.colorActive ?: "#FF0000").replace("#", "")
+    String toHex   = inactiveColorFor(idx).replace("#", "")
+    int fromR = Integer.parseInt(fromHex[0..1], 16)
+    int fromG = Integer.parseInt(fromHex[2..3], 16)
+    int fromB = Integer.parseInt(fromHex[4..5], 16)
+    int toR   = Integer.parseInt(toHex[0..1], 16)
+    int toG   = Integer.parseInt(toHex[2..3], 16)
+    int toB   = Integer.parseInt(toHex[4..5], 16)
+
+    int r = Math.max(0, Math.min(255, Math.round(fromR + (toR - fromR) * t) as int))
+    int g = Math.max(0, Math.min(255, Math.round(fromG + (toG - fromG) * t) as int))
+    int b = Math.max(0, Math.min(255, Math.round(fromB + (toB - fromB) * t) as int))
+    String hex = sprintf("#%02X%02X%02X", r, g, b)
     debugLog "Fade sensor ${idx} step ${step}/${maxSteps} → ${hex}"
     publishColor(idx, hex)
 
@@ -546,7 +640,9 @@ private void doFadeStep(int idx) {
     } else {
         state.remove("fadeStep${idx}")
         debugLog "Fade sensor ${idx} complete — snapping to inactive color"
-        publishColor(idx, inactiveColorFor(idx))
+        String snapColor = inactiveColorFor(idx)
+        publishColor(idx, snapColor)
+        publishTextColor(idx, snapColor)
 
         if (settings.backlightOnMotion && allInactive() && !state.screenIdle) {
             unschedule(backlightOff)
@@ -560,6 +656,44 @@ private void doFadeStep(int idx) {
     }
 }
 
+
+// ── Text color helper ────────────────────────────────────────────────────────
+
+/**
+ * textColorFor — returns black or white depending on the luminance of the
+ * given hex color, so text always remains readable against the tile background.
+ * Uses the W3C relative luminance formula (sRGB).
+ */
+private String textColorFor(String hex) {
+    String h = hex.replace("#", "")
+    int r = Integer.parseInt(h[0..1], 16)
+    int g = Integer.parseInt(h[2..3], 16)
+    int b = Integer.parseInt(h[4..5], 16)
+    // sRGB luminance
+    double rL = r / 255.0
+    double gL = g / 255.0
+    double bL = b / 255.0
+    double luminance = 0.2126 * rL + 0.7152 * gL + 0.0722 * bL
+    return luminance > 0.35 ? "black" : "white"
+}
+
+/**
+ * publishTextColor — updates the text_color of a btn tile to ensure
+ * readability against the current background color.
+ */
+private void publishTextColor(int sensorIdx, String bgHex) {
+    String node    = settings.haspNode ?: "plate"
+    int    obj     = bgId(sensorIdx)
+    String color   = textColorFor(bgHex)
+    String topic   = "hasp/${node}/command/p1b${obj}.jsonl"
+    String payload = "{\"text_color\":\"${color}\"}"
+    debugLog "TextColor → ${topic} : ${color}"
+    try {
+        interfaces.mqtt.publish(topic, payload, 1, false)
+    } catch (Exception e) {
+        infoLog "[SenseCAP] ERROR — TextColor publish failed: ${e.message}"
+    }
+}
 
 // ── Icon codepoints (MDI built-in subset) ────────────────────────────────────
 // Active state (alert):
@@ -824,15 +958,19 @@ def resyncStates() {
     (1..maxSensors()).each { idx ->
         String currentState = state["sensor${idx}"] ?: "inactive"
         if (currentState == "active") {
-            publishColor(idx, settings.colorActive ?: "#FF0000")
+            String aC = settings.colorActive ?: "#FF0000"
+            publishColor(idx, aC)
+            publishTextColor(idx, aC)
             publishIcon(idx, activeIconFor(idx))
         } else if (state["fadeStep${idx}"] != null) {
-            int step = (state["fadeStep${idx}"] ?: 0) as int
-            int red  = Math.round(255.0 * (1.0 - (step / FADE_STEPS as double))) as int
-            publishColor(idx, sprintf("#%02X0000", Math.max(0, Math.min(255, red))))
+            // Resyncing mid-fade — show active color; fade will resume naturally
+            publishColor(idx, settings.colorActive ?: "#FF0000")
+            publishTextColor(idx, settings.colorActive ?: "#FF0000")
             publishIcon(idx, inactiveIconFor(idx))
         } else {
-            publishColor(idx, inactiveColorFor(idx))
+            String iC = inactiveColorFor(idx)
+            publishColor(idx, iC)
+            publishTextColor(idx, iC)
             publishIcon(idx, inactiveIconFor(idx))
         }
     }
