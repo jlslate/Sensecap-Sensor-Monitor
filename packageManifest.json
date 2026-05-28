@@ -1,0 +1,30 @@
+{
+  "packageName": "OpenCAP Sensor Monitor",
+  "author": "jlslate (slate)",
+  "version": "3.0.0",
+  "minimumHEVersion": "2.3.0",
+  "dateReleased": "2026-05-27",
+  "releaseNotes": "v3.0.0: State-driven icons per sensor type, color picker with 15 color palette, active-to-inactive color fade interpolation, single grid setting in app, optimised batched MQTT layout push, automatic text color contrast (black/white) based on tile background luminance.",
+  "documentationLink": "https://github.com/jlslate/OpenCAP-Sensor-Monitor/blob/main/README.md",
+  "communityLink": "",
+  "apps": [
+    {
+      "id": "326f9abb-6664-402c-85f4-ba99eb924f2b",
+      "name": "SenseCAP Indicator Motion",
+      "namespace": "community",
+      "location": "https://raw.githubusercontent.com/jlslate/OpenCAP-Sensor-Monitor/main/Sensecap sensor monitor app.groovy",
+      "required": true,
+      "oauth": false,
+      "primary": true
+    }
+  ],
+  "drivers": [
+    {
+      "id": "a05bd9e1-aeca-42bb-acef-96d699c4ec34",
+      "name": "SenseCAP Indicator Motion",
+      "namespace": "community",
+      "location": "https://raw.githubusercontent.com/jlslate/OpenCAP-Sensor-Monitor/main/Sensecap sensor monitor driver.groovy",
+      "required": true
+    }
+  ]
+}
