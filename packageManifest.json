@@ -1,30 +1,33 @@
 {
-  "packageName": "OpenCAP Sensor Monitor",
+  "packageName": "SenseCAP Sensor Monitor",
   "author": "jlslate (slate)",
-  "version": "3.1.0",
   "minimumHEVersion": "2.3.0",
-  "dateReleased": "2026-05-27",
-  "releaseNotes": "v3.1.0: Grid sizes 1x1 through 7x7 (1-49 sensors). Empty slot support \u2014 set type to \"No sensor\" for a slate background tile. Sensor displayName used as default label with emoji stripping. Letter icons (M/C/W/S) for 6x6 and 7x7 dense grids. Active-to-inactive color fade interpolation. 15-color palette for all tile colors. Luminance-based text color contrast.",
-  "documentationLink": "https://github.com/jlslate/OpenCAP-Sensor-Monitor/blob/main/README.md",
-  "communityLink": "",
+  "licenseFile": "",
+  "releaseNotes": "Initial release — displays Hubitat sensor states on SenseCAP Indicator D1 via MQTT/openHASP",
+  "dateReleased": "2026-05-29",
+  "version": "4.0.0",
   "apps": [
     {
-      "id": "326f9abb-6664-402c-85f4-ba99eb924f2b",
-      "name": "SenseCAP Indicator Motion",
+      "id": "f1a2b3c4-0001-0001-0001-000000000001",
+      "name": "SenseCAP Sensor Monitor",
       "namespace": "community",
-      "location": "https://raw.githubusercontent.com/jlslate/OpenCAP-Sensor-Monitor/main/Sensecap sensor monitor app.groovy",
+      "location": "https://raw.githubusercontent.com/jlslate/sensecap-sensor-monitor/main/sensecap-sensor-app.groovy",
       "required": true,
+      "primary": true,
       "oauth": false,
-      "primary": true
+      "version": "4.0.0",
+      "betaLocation": ""
     }
   ],
   "drivers": [
     {
-      "id": "a05bd9e1-aeca-42bb-acef-96d699c4ec34",
-      "name": "SenseCAP Indicator Motion",
+      "id": "f1a2b3c4-0002-0002-0002-000000000002",
+      "name": "SenseCAP Sensor Monitor",
       "namespace": "community",
-      "location": "https://raw.githubusercontent.com/jlslate/OpenCAP-Sensor-Monitor/main/Sensecap sensor monitor driver.groovy",
-      "required": true
+      "location": "https://raw.githubusercontent.com/jlslate/sensecap-sensor-monitor/main/sensecap-sensor-driver.groovy",
+      "required": true,
+      "version": "4.0.0",
+      "betaLocation": ""
     }
   ]
 }
