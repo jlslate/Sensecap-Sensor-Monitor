@@ -10,7 +10,7 @@
  * Navigation buttons on every page cycle forward (▶) and back (◀).
  *
  * Author: jlslate (slate)
- * Version: 3.5.0 — five pages, consistent p1/p2/p3/p4/p5 naming
+ * Version: 4.1.0 — five pages, consistent p1/p2/p3/p4/p5 naming
  */
 
 import groovy.transform.Field
